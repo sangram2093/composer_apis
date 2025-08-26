@@ -1,0 +1,13 @@
+# 1) Get a token using your Python helper (print out creds.token) or any ADC token source
+ACCESS_TOKEN="ya29...."
+
+# 2) Try GET environment (read-only)
+ENV="projects/PROJECT_ID/locations/LOCATION/environments/ENV_NAME"
+curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+  "https://composer.googleapis.com/v1/$ENV" | jq .
+
+# 3) Try executeAirflowCommand (write)
+curl -s -X POST -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://composer.googleapis.com/v1/$ENV:executeAirflowCommand" \
+  -d '{"command":"dags","subcommand":"trigger","parameters":["example_dag","--run-id=debug"]}' | jq .
