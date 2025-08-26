@@ -27,3 +27,13 @@ def whoami_and_env_get(project_id, location, environment):
 
 # Run it:
 # whoami_and_env_get("my-project", "us-central1", "my-composer-env")
+import google.auth
+from google.auth.transport.requests import Request
+
+creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+if not creds.valid:
+    creds.refresh(Request())
+
+print("Creds type:", type(creds).__name__)
+print("Scopes:", getattr(creds, "scopes", None))
+print("Service Account (if exposed):", getattr(creds, "service_account_email", None))
