@@ -2,6 +2,7 @@ import json, time, requests
 import google.auth
 from google.auth.transport.requests import Request
 
+COMPOSER_BASE = "https://composer.googleapis.com/v1"
 
 def _bearer():
     creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
@@ -9,73 +10,77 @@ def _bearer():
         creds.refresh(Request())
     return f"Bearer {creds.token}"
 
-
 def _env_name(project_id, location, env):
     return f"projects/{project_id}/locations/{location}/environments/{env}"
 
+def _post_or_explain(url, headers, payload, timeout=60):
+    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    if r.status_code >= 400:
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text}
+        raise RuntimeError(f"HTTP {r.status_code} POST {url}\nPayload={json.dumps(payload)}\nResponse=\n{json.dumps(body, indent=2)}")
+    return r
 
-def _exec_airflow_command(project_id, location, env, command, subcommand, params):
-    url = f"https://composer.googleapis.com/v1/{_env_name(project_id, location, env)}:executeAirflowCommand"
-    r = requests.post(url, headers={"Authorization": _bearer()}, json={
-        "command": command,
-        "subcommand": subcommand,
-        "parameters": params
-    }, timeout=60)
-    r.raise_for_status()
-    j = r.json()
+def execute_airflow_command(project_id, location, env, command, subcommand, parameters):
+    url = f"{COMPOSER_BASE}/{_env_name(project_id, location, env)}:executeAirflowCommand"
+    hdrs = {"Authorization": _bearer(), "Content-Type":"application/json"}
+    payload = {"command": command, "subcommand": subcommand, "parameters": parameters}
+    resp = _post_or_explain(url, hdrs, payload)
+    j = resp.json()
+    # Sanity: ensure these exist
+    for k in ["executionId", "pod", "podNamespace"]:
+        if k not in j or not j[k]:
+            raise RuntimeError(f"Composer did not return '{k}' in executeAirflowCommand response: {json.dumps(j, indent=2)}")
     return j["executionId"], j["pod"], j["podNamespace"]
 
+def poll_airflow_command(project_id, location, env, execution_id, pod, pod_namespace, timeout=300, sleep_s=2):
+    url = f"{COMPOSER_BASE}/{_env_name(project_id, location, env)}:pollAirflowCommand"
+    hdrs = {"Authorization": _bearer(), "Content-Type":"application/json"}
 
-def _poll_airflow_command(project_id, location, env, execution_id, pod, pod_ns, timeout=180):
-    url = f"https://composer.googleapis.com/v1/{_env_name(project_id, location, env)}:pollAirflowCommand"
-    next_line = 0
-    start = time.time()
+    next_line = 0  # must be an integer; start at 0
     logs = []
+    start = time.time()
+
     while True:
         if time.time() - start > timeout:
-            raise TimeoutError("poll timed out")
+            raise TimeoutError(f"Polling timed out after {timeout}s")
 
-        body = {"executionId": execution_id, "pod": pod, "podNamespace": pod_ns, "nextLineNumber": next_line}
-        r = requests.post(url, headers={"Authorization": _bearer()}, json=body, timeout=60)
-        r.raise_for_status()
+        body = {
+            "executionId": execution_id,      # must match executeAirflowCommand exactly
+            "pod": pod,                       # must match
+            "podNamespace": pod_namespace,    # must match
+            "nextLineNumber": next_line       # integer
+        }
+        r = _post_or_explain(url, hdrs, body)
         j = r.json()
+
         for line in j.get("output", []):
             logs.append(line["content"])
-            next_line = line["lineNumber"] + 1
+            next_line = line["lineNumber"] + 1  # advance by last+1
 
-        if j.get("outputEnd"):
-            return logs, j.get("exitInfo", {})
+        if j.get("outputEnd", False):
+            exit_info = j.get("exitInfo", {}) or {}
+            return {
+                "logs": logs,
+                "exit_code": exit_info.get("exitCode"),
+                "error": exit_info.get("error"),
+            }
 
-        time.sleep(2)
+        time.sleep(sleep_s)
 
+def trigger_and_poll(project_id, location, env, dag_id, run_id=None, conf=None):
+    params = [dag_id]
+    if run_id:
+        params.append(f"--run-id={run_id}")
+    if conf is not None:
+        params.append(f"--conf={json.dumps(conf, separators=(',', ':'))}")
 
-def list_dag_runs(project_id, location, env, dag_id):
-    exec_id, pod, ns = _exec_airflow_command(
-        project_id, location, env,
-        "dags", "list-runs", ["-d", dag_id, "-o", "json"]
-    )
-    logs, exit_info = _poll_airflow_command(project_id, location, env, exec_id, pod, ns)
+    exec_id, pod, pod_ns = execute_airflow_command(project_id, location, env, "dags", "trigger", params)
+    return poll_airflow_command(project_id, location, env, exec_id, pod, pod_ns)
 
-    # join logs, extract JSON array
-    output = "\n".join(logs)
-    first = output.find("[")
-    last = output.rfind("]")
-    runs = []
-    if first != -1 and last != -1:
-        try:
-            runs = json.loads(output[first:last+1])
-        except Exception:
-            print("Failed to parse logs as JSON. Raw output:\n", output)
-
-    return {"runs": runs, "exit_info": exit_info, "raw_logs": logs}
-
-
-# Example usage:
-if __name__ == "__main__":
-    PROJECT = "your-project"
-    LOCATION = "us-central1"
-    ENV = "your-composer-env"
-    DAG_ID = "example_dag"
-
-    result = list_dag_runs(PROJECT, LOCATION, ENV, DAG_ID)
-    print(json.dumps(result["runs"], indent=2))
+# Example:
+# result = trigger_and_poll("my-project", "europe-west3", "my-env", "example_dag", run_id="manual__via_api")
+# print(result["exit_code"], result["error"])
+# print("\n".join(result["logs"][-20:]))
