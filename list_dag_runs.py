@@ -36,10 +36,10 @@ def execute_airflow_command(project_id, location, env, command, subcommand, para
     return j["executionId"], j["pod"], j["podNamespace"]
 
 def poll_airflow_command(project_id, location, env, execution_id, pod, pod_namespace, timeout=300, sleep_s=2):
-    url = f"{COMPOSER_BASE}/{_env_name(project_id, location, env)}:pollAirflowCommand"
+    url = f"https://composer.googleapis.com/v1/projects/{project_id}/locations/{location}/environments/{env}:pollAirflowCommand"
     hdrs = {"Authorization": _bearer(), "Content-Type":"application/json"}
 
-    next_line = 0  # must be an integer; start at 0
+    next_line = 1                 # <-- start at 1 (must be positive)
     logs = []
     start = time.time()
 
@@ -48,17 +48,19 @@ def poll_airflow_command(project_id, location, env, execution_id, pod, pod_names
             raise TimeoutError(f"Polling timed out after {timeout}s")
 
         body = {
-            "executionId": execution_id,      # must match executeAirflowCommand exactly
-            "pod": pod,                       # must match
-            "podNamespace": pod_namespace,    # must match
-            "nextLineNumber": next_line       # integer
+            "executionId": execution_id,
+            "pod": pod,
+            "podNamespace": pod_namespace,
+            "nextLineNumber": int(next_line)  # <-- ensure integer, not str
         }
-        r = _post_or_explain(url, hdrs, body)
+        r = requests.post(url, headers=hdrs, json=body, timeout=60)
+        r.raise_for_status()
         j = r.json()
 
         for line in j.get("output", []):
             logs.append(line["content"])
-            next_line = line["lineNumber"] + 1  # advance by last+1
+            # API returns 0-based or 1-based depending on Airflow image; always advance by last+1
+            next_line = line["lineNumber"] + 1
 
         if j.get("outputEnd", False):
             exit_info = j.get("exitInfo", {}) or {}
